@@ -1,38 +1,250 @@
-import { useCallback, useEffect, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { supabase, configured } from './lib/supabase'
+import { isValidPhone, isValidPin, normalizePhone, toLoginEmail } from './lib/auth'
 import { STATUS, ROLE_TH, type Role, type Transition } from './lib/workflow'
 
-interface Profile { id: string; full_name: string; display_name: string | null; role: Role }
+interface Profile { id: string; full_name: string; display_name: string | null; role: Role; approval_status: 'pending' | 'approved' | 'rejected' }
 interface Idea { id: string; code: string; title: string; description: string | null; status: string; owner_id: string; assignee_id: string | null; is_demo: boolean; created_at: string }
 interface Hist { id: number; from_status: string | null; to_status: string; note: string | null; created_at: string }
 
 const Badge = ({ s }: { s: string }) => <span className={`rounded px-2 py-0.5 text-xs font-medium ${STATUS[s]?.color}`}>{STATUS[s]?.th ?? s}</span>
 
+interface TurnstileApi {
+  render: (container: HTMLElement, options: {
+    sitekey: string
+    callback: (token: string) => void
+    'expired-callback': () => void
+    'error-callback': () => void
+  }) => string
+  reset: (widgetId: string) => void
+  remove: (widgetId: string) => void
+}
+
+declare global {
+  interface Window { turnstile?: TurnstileApi }
+}
+
+function Turnstile({ onToken, onError, resetKey }: { onToken: (token: string) => void; onError: () => void; resetKey: number }) {
+  const container = useRef<HTMLDivElement>(null)
+  const tokenHandler = useRef(onToken)
+  const errorHandler = useRef(onError)
+  const widgetId = useRef<string>()
+  const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY as string | undefined
+  tokenHandler.current = onToken
+  errorHandler.current = onError
+
+  useEffect(() => {
+    if (!siteKey || !container.current) return
+    let active = true
+    const handleScriptError = () => errorHandler.current()
+    const render = () => {
+      if (!active || !window.turnstile || !container.current || widgetId.current) return
+      widgetId.current = window.turnstile.render(container.current, {
+        sitekey: siteKey,
+        callback: token => tokenHandler.current(token),
+        'expired-callback': () => tokenHandler.current(''),
+        'error-callback': () => { tokenHandler.current(''); errorHandler.current() },
+      })
+    }
+
+    if (window.turnstile) render()
+    else {
+      let script = document.querySelector<HTMLScriptElement>('script[data-turnstile]')
+      if (!script) {
+        script = document.createElement('script')
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+        script.async = true
+        script.defer = true
+        script.dataset.turnstile = 'true'
+        document.head.appendChild(script)
+      }
+      script.addEventListener('load', render)
+      script.addEventListener('error', handleScriptError)
+      return () => {
+        active = false
+        script?.removeEventListener('load', render)
+        script?.removeEventListener('error', handleScriptError)
+        if (widgetId.current && window.turnstile) window.turnstile.remove(widgetId.current)
+        widgetId.current = undefined
+      }
+    }
+    return () => {
+      active = false
+      if (widgetId.current && window.turnstile) window.turnstile.remove(widgetId.current)
+      widgetId.current = undefined
+    }
+  }, [siteKey])
+
+  useEffect(() => {
+    if (resetKey > 0 && widgetId.current && window.turnstile) window.turnstile.reset(widgetId.current)
+  }, [resetKey])
+
+  return siteKey ? <div ref={container} aria-label="การยืนยันความปลอดภัย" /> : null
+}
+
 function Login() {
-  const [email, setEmail] = useState(''); const [pw, setPw] = useState(''); const [name, setName] = useState('')
-  const [signup, setSignup] = useState(false); const [msg, setMsg] = useState('')
+  const [mode, setMode] = useState<'employee' | 'admin' | 'signup'>('employee')
+  const [phone, setPhone] = useState(''); const [email, setEmail] = useState('')
+  const [pin, setPin] = useState(''); const [confirmPin, setConfirmPin] = useState('')
+  const [name, setName] = useState(''); const [joinCode, setJoinCode] = useState('')
+  const [captchaToken, setCaptchaToken] = useState(''); const [captchaReset, setCaptchaReset] = useState(0)
+  const [busy, setBusy] = useState(false); const [msg, setMsg] = useState('')
+  const signup = mode === 'signup'
   async function go(e: FormEvent) {
-    e.preventDefault(); setMsg('')
-    const { error } = signup
-      ? await supabase.auth.signUp({ email, password: pw, options: { data: { full_name: name } } })
-      : await supabase.auth.signInWithPassword({ email, password: pw })
-    if (error) setMsg('เข้าสู่ระบบไม่สำเร็จ: ' + error.message)
-    else if (signup) setMsg('สมัครแล้ว หากระบบเปิดยืนยันอีเมล โปรดตรวจกล่องจดหมาย')
+    e.preventDefault()
+    setMsg('')
+    setBusy(true)
+    try {
+      if (signup) {
+        if (!isValidPhone(phone)) { setMsg('กรุณากรอกเบอร์โทรศัพท์ 10 หลัก โดยขึ้นต้นด้วย 0'); return }
+        if (!isValidPin(pin)) { setMsg('PIN ต้องมี 6-8 หลัก และห้ามเป็นเลขซ้ำหรือลำดับตรง'); return }
+        if (pin !== confirmPin) { setMsg('PIN และยืนยัน PIN ไม่ตรงกัน'); return }
+        if (import.meta.env.VITE_TURNSTILE_SITE_KEY && !captchaToken) { setMsg('กรุณายืนยันความปลอดภัยก่อนสมัคร'); return }
+        const { error } = await supabase.auth.signUp({
+          email: toLoginEmail(phone),
+          password: pin,
+          options: {
+            data: { full_name: name.trim(), phone: normalizePhone(phone), join_code: joinCode.trim() },
+            captchaToken: captchaToken || undefined,
+          },
+        })
+        if (error) {
+          const message = error.message.toLowerCase()
+          if (message.includes('already registered') || message.includes('already exists') || message.includes('user exists')) setMsg('เบอร์นี้ลงทะเบียนแล้ว')
+          else if (message.includes('database error saving new user') || message.includes('join code') || message.includes('รหัสเข้าร่วม')) setMsg('รหัสเข้าร่วมไม่ถูกต้อง')
+          else setMsg('สมัครไม่สำเร็จ: ' + error.message)
+          setCaptchaToken('')
+          setCaptchaReset(value => value + 1)
+        } else {
+          setMsg('สมัครแล้ว บัญชีรอแอดมินอนุมัติก่อนใช้งาน')
+        }
+      } else {
+        const { error } = await supabase.auth.signInWithPassword(
+          mode === 'admin'
+            ? { email, password: pin }
+            : { email: toLoginEmail(phone), password: pin },
+        )
+        if (error) setMsg(mode === 'employee' ? 'เบอร์โทรหรือ PIN ไม่ถูกต้อง' : 'เข้าสู่ระบบไม่สำเร็จ: ' + error.message)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ'
+      setMsg(signup ? 'สมัครไม่สำเร็จ: ' + message : mode === 'employee' ? 'เบอร์โทรหรือ PIN ไม่ถูกต้อง' : 'เข้าสู่ระบบไม่สำเร็จ: ' + message)
+    } finally {
+      setBusy(false)
+    }
   }
   return (
     <div className="grid min-h-screen place-items-center bg-navy p-4">
       <form onSubmit={go} className="w-full max-w-sm space-y-3 rounded-lg bg-white p-6">
-        <h1 className="text-2xl font-semibold text-navy">SSC Creator</h1>
+        <img src="/ssc-logo-192.png" alt="SSC Creator" className="mx-auto h-24 w-24 object-contain" />
+        <h1 className="text-center text-2xl font-semibold text-navy">SSC Creator</h1>
         <p className="text-sm text-slate-500">พื้นที่สร้างสรรค์คอนเทนต์ของ สีสกุลไชย</p>
-        {signup && <input className="w-full rounded border p-2" placeholder="ชื่อ-นามสกุล" value={name} onChange={e => setName(e.target.value)} required />}
-        <input className="w-full rounded border p-2" type="email" placeholder="อีเมล" value={email} onChange={e => setEmail(e.target.value)} required />
-        <input className="w-full rounded border p-2" type="password" minLength={8} placeholder="รหัสผ่าน (8 ตัวขึ้นไป)" value={pw} onChange={e => setPw(e.target.value)} required />
+        {!signup && <div className="flex items-center justify-center gap-4 text-sm">
+          <button type="button" className={`underline ${mode === 'employee' ? 'font-semibold' : ''}`} onClick={() => { setMode('employee'); setMsg('') }}>พนักงาน</button>
+          <button type="button" className={`underline ${mode === 'admin' ? 'font-semibold' : ''}`} onClick={() => { setMode('admin'); setMsg('') }}>สำหรับผู้ดูแลระบบ</button>
+        </div>}
+        {signup && <label className="block text-sm">ชื่อ-นามสกุล
+          <input className="mt-1 w-full rounded border p-2" autoComplete="name" value={name} onChange={e => setName(e.target.value)} required />
+        </label>}
+        {mode === 'admin' && <label className="block text-sm">อีเมล
+          <input className="mt-1 w-full rounded border p-2" type="email" autoComplete="username" value={email} onChange={e => setEmail(e.target.value)} required />
+        </label>}
+        {(mode === 'employee' || signup) && <label className="block text-sm">เบอร์โทรศัพท์
+          <input className="mt-1 w-full rounded border p-2" type="tel" inputMode="numeric" autoComplete="tel" maxLength={12} value={phone} onChange={e => setPhone(e.target.value)} required />
+        </label>}
+        <label className="block text-sm">{signup ? 'PIN ใหม่ (6-8 หลัก)' : mode === 'admin' ? 'รหัสผ่าน' : 'PIN'}
+          <input className="mt-1 w-full rounded border p-2" type="password" inputMode={mode === 'admin' ? undefined : 'numeric'} autoComplete={signup ? 'new-password' : 'current-password'} maxLength={mode === 'admin' ? undefined : 8} value={pin} onChange={e => setPin(e.target.value)} required />
+        </label>
+        {signup && <>
+          <label className="block text-sm">ยืนยัน PIN
+            <input className="mt-1 w-full rounded border p-2" type="password" inputMode="numeric" autoComplete="new-password" maxLength={8} value={confirmPin} onChange={e => setConfirmPin(e.target.value)} required />
+          </label>
+          <label className="block text-sm">รหัสเข้าร่วมบริษัท
+            <input className="mt-1 w-full rounded border p-2" value={joinCode} onChange={e => setJoinCode(e.target.value)} required />
+          </label>
+          <Turnstile onToken={setCaptchaToken} onError={() => setMsg('โหลดการยืนยันความปลอดภัยไม่สำเร็จ กรุณาลองใหม่')} resetKey={captchaReset} />
+        </>}
         {msg && <p className="text-sm text-red-600" role="alert">{msg}</p>}
-        <button className="w-full rounded bg-mint p-2 font-medium text-white">{signup ? 'สมัครใช้งาน' : 'เข้าสู่ระบบ'}</button>
-        <button type="button" className="w-full text-sm text-navy underline" onClick={() => setSignup(!signup)}>{signup ? 'มีบัญชีแล้ว' : 'สร้างบัญชีใหม่'}</button>
+        <button disabled={busy} className="w-full rounded bg-mint p-2 font-medium text-white disabled:opacity-60">{busy ? 'กำลังดำเนินการ…' : signup ? 'สมัครใช้งาน' : 'เข้าสู่ระบบ'}</button>
+        <button type="button" className="w-full text-sm text-navy underline" onClick={() => { setMode(signup ? 'employee' : 'signup'); setMsg('') }}>{signup ? 'กลับไปเข้าสู่ระบบ' : 'สมัครเป็นพนักงานใหม่'}</button>
       </form>
     </div>)
+}
+
+function ApprovalNotice({ status }: { status: Profile['approval_status'] }) {
+    const pending = status === 'pending'
+    return (
+      <main className="grid min-h-screen place-items-center bg-navy p-4">
+        <section className="w-full max-w-md space-y-4 rounded-lg bg-white p-6 text-center">
+          <h1 className="text-xl font-semibold text-navy">{pending ? 'บัญชีรอแอดมินอนุมัติ' : 'บัญชีไม่ได้รับการอนุมัติ'}</h1>
+          <p>{pending ? 'ผู้ดูแลระบบจะตรวจสอบข้อมูลก่อนเปิดให้ใช้งาน กรุณากลับมาตรวจสอบภายหลัง' : 'กรุณาติดต่อผู้ดูแลระบบของบริษัทหากคิดว่าเกิดข้อผิดพลาด'}</p>
+          <button className="rounded bg-mint px-4 py-2 text-white" onClick={() => supabase.auth.signOut()}>ออกจากระบบ</button>
+        </section>
+      </main>
+    )
+}
+
+function ChangePin() {
+    const [phone, setPhone] = useState('')
+    const [currentPin, setCurrentPin] = useState('')
+    const [newPin, setNewPin] = useState('')
+    const [confirmPin, setConfirmPin] = useState('')
+    const [msg, setMsg] = useState('')
+    const [err, setErr] = useState('')
+    const [busy, setBusy] = useState(false)
+
+    useEffect(() => {
+      supabase.from('profile_private').select('phone').single().then(({ data, error }) => {
+        if (error) setErr('โหลดข้อมูลบัญชีไม่สำเร็จ: ' + error.message)
+        else setPhone(data.phone)
+      })
+    }, [])
+
+    async function save(e: FormEvent) {
+      e.preventDefault()
+      setErr('')
+      setMsg('')
+      if (!isValidPin(newPin)) return setErr('PIN ใหม่ต้องมี 6-8 หลัก และห้ามเป็นเลขซ้ำหรือลำดับตรง')
+      if (newPin !== confirmPin) return setErr('PIN ใหม่และยืนยัน PIN ไม่ตรงกัน')
+      setBusy(true)
+      try {
+        const { error: verifyError } = await supabase.auth.signInWithPassword({ email: toLoginEmail(phone), password: currentPin })
+        if (verifyError) return setErr('PIN ปัจจุบันไม่ถูกต้อง')
+        const { error: updateError } = await supabase.auth.updateUser({ password: newPin })
+        if (updateError) setErr('เปลี่ยน PIN ไม่สำเร็จ: ' + updateError.message)
+        else {
+          setCurrentPin('')
+          setNewPin('')
+          setConfirmPin('')
+          setMsg('เปลี่ยน PIN แล้ว')
+        }
+      } catch (error) {
+        setErr('เปลี่ยน PIN ไม่สำเร็จ: ' + (error instanceof Error ? error.message : 'เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ'))
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    return (
+      <main className="mx-auto max-w-xl space-y-3 p-4">
+        <h1 className="text-lg font-semibold">เปลี่ยน PIN</h1>
+        <form onSubmit={save} className="space-y-3 rounded bg-white p-4">
+          <label className="block text-sm">PIN ปัจจุบัน
+            <input className="mt-1 w-full rounded border p-2" type="password" inputMode="numeric" autoComplete="current-password" maxLength={8} value={currentPin} onChange={e => setCurrentPin(e.target.value)} required />
+          </label>
+          <label className="block text-sm">PIN ใหม่ (6-8 หลัก)
+            <input className="mt-1 w-full rounded border p-2" type="password" inputMode="numeric" autoComplete="new-password" maxLength={8} value={newPin} onChange={e => setNewPin(e.target.value)} required />
+          </label>
+          <label className="block text-sm">ยืนยัน PIN ใหม่
+            <input className="mt-1 w-full rounded border p-2" type="password" inputMode="numeric" autoComplete="new-password" maxLength={8} value={confirmPin} onChange={e => setConfirmPin(e.target.value)} required />
+          </label>
+          {err && <p className="text-sm text-red-600" role="alert">{err}</p>}
+          {msg && <p className="text-sm text-green-700" role="status">{msg}</p>}
+          <button disabled={busy || !phone} className="rounded bg-mint px-4 py-2 text-white disabled:opacity-60">{busy ? 'กำลังบันทึก…' : 'บันทึก PIN ใหม่'}</button>
+        </form>
+      </main>
+    )
 }
 
 function NewIdea({ onDone }: { onDone: () => void }) {
@@ -319,30 +531,128 @@ function Compliance({ me }: { me: Profile }) {
     </section>)
 }
 
-interface Prof { id: string; full_name: string; display_name: string | null; role: Role; is_active: boolean; exempt_from_submission: boolean }
+interface Prof {
+  id: string
+  full_name: string
+  display_name: string | null
+  role: Role
+  is_active: boolean
+  exempt_from_submission: boolean
+  employee_code: string | null
+  approval_status: 'pending' | 'approved' | 'rejected'
+  created_at: string
+}
+interface PendingProf { id: string; full_name: string; phone: string | null; created_at: string }
 interface Pol { enabled: boolean; deadline_dow: number; required_count: number; start_date: string }
 const DOW = ['จันทร์', 'อังคาร', 'พุธ', 'พฤหัสบดี', 'ศุกร์', 'เสาร์', 'อาทิตย์']
 function Admin() {
-  const [users, setUsers] = useState<Prof[]>([]); const [pol, setPol] = useState<Pol | null>(null); const [aud, setAud] = useState<{ id: number; action: string; detail: unknown; created_at: string }[]>([]); const [msg, setMsg] = useState('')
+  const [users, setUsers] = useState<Prof[]>([])
+  const [pending, setPending] = useState<PendingProf[]>([])
+  const [approveRoles, setApproveRoles] = useState<Record<string, Role>>({})
+  const [codeDrafts, setCodeDrafts] = useState<Record<string, string>>({})
+  const [pol, setPol] = useState<Pol | null>(null)
+  const [joinCode, setJoinCode] = useState('')
+  const [aud, setAud] = useState<{ id: number; action: string; detail: unknown; created_at: string }[]>([])
+  const [msg, setMsg] = useState('')
+  const [err, setErr] = useState('')
   const load = useCallback(async () => {
-    const u = await supabase.from('profiles').select('id,full_name,display_name,role,is_active,exempt_from_submission').order('full_name'); setUsers((u.data as Prof[]) ?? [])
-    const p = await supabase.from('submission_policy').select('enabled,deadline_dow,required_count,start_date').single(); setPol(p.data as Pol | null)
-    const a = await supabase.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(30); setAud((a.data as typeof aud) ?? [])
+    const [u, p, a, setting] = await Promise.all([
+      supabase.from('profiles').select('id,full_name,display_name,role,is_active,exempt_from_submission,employee_code,approval_status,created_at').order('full_name'),
+      supabase.from('submission_policy').select('enabled,deadline_dow,required_count,start_date').single(),
+      supabase.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(30),
+      supabase.from('app_settings').select('value').eq('key', 'join_code').single(),
+    ])
+    if (u.error || p.error || a.error || setting.error) {
+      setErr('โหลดข้อมูลผู้ดูแลไม่สำเร็จ: ' + (u.error ?? p.error ?? a.error ?? setting.error)?.message)
+      return
+    }
+    const profiles = (u.data as Prof[]) ?? []
+    setUsers(profiles)
+    setCodeDrafts(Object.fromEntries(profiles.map(profile => [profile.id, profile.employee_code ?? ''])))
+    const waiting = profiles.filter(profile => profile.approval_status === 'pending')
+    const privateData = waiting.length
+      ? await supabase.from('profile_private').select('user_id,phone').in('user_id', waiting.map(profile => profile.id))
+      : { data: [], error: null }
+    if (privateData.error) {
+      setErr('โหลดเบอร์โทรศัพท์ผู้สมัครไม่สำเร็จ: ' + privateData.error.message)
+      return
+    }
+    const phones = new Map(((privateData.data ?? []) as { user_id: string; phone: string }[]).map(entry => [entry.user_id, entry.phone]))
+    setPending(waiting.map(profile => ({ id: profile.id, full_name: profile.full_name, phone: phones.get(profile.id) ?? null, created_at: profile.created_at })))
+    setApproveRoles(current => Object.fromEntries(waiting.map(profile => [profile.id, current[profile.id] ?? 'employee'])))
+    setPol(p.data as Pol | null)
+    setAud((a.data as typeof aud) ?? [])
+    setJoinCode(setting.data.value)
+    setErr('')
   }, [])
   useEffect(() => { load() }, [load])
-  async function upd(id: string, patch: Partial<Prof>) { const { error } = await supabase.from('profiles').update(patch).eq('id', id); setMsg(error ? error.message : 'บันทึกแล้ว'); load() }
-  async function savePol() { if (!pol) return; const { error } = await supabase.from('submission_policy').update(pol).eq('id', true); setMsg(error ? error.message : 'บันทึกกติกาแล้ว'); load() }
+  async function upd(id: string, patch: Partial<Prof>) {
+    setErr('')
+    const { error } = await supabase.from('profiles').update(patch).eq('id', id)
+    if (error) setErr('บันทึกไม่สำเร็จ: ' + error.message)
+    else { setMsg('บันทึกแล้ว'); await load() }
+  }
+  async function approve(user: PendingProf) {
+    await upd(user.id, { role: approveRoles[user.id] ?? 'employee', approval_status: 'approved' })
+  }
+  async function savePol() {
+    if (!pol) return
+    const { error } = await supabase.from('submission_policy').update(pol).eq('id', true)
+    if (error) setErr('บันทึกกติกาไม่สำเร็จ: ' + error.message)
+    else { setMsg('บันทึกกติกาแล้ว'); await load() }
+  }
+  async function saveJoinCode() {
+    if (!joinCode.trim()) {
+      setErr('รหัสเข้าร่วมต้องไม่เว้นว่าง')
+      return
+    }
+    const { error } = await supabase.from('app_settings').update({ value: joinCode.trim() }).eq('key', 'join_code')
+    if (error) setErr('เปลี่ยนรหัสเข้าร่วมไม่สำเร็จ: ' + error.message)
+    else setMsg('เปลี่ยนรหัสเข้าร่วมแล้ว')
+  }
   return (
-    <div className="mx-auto max-w-6xl space-y-4 p-4"><h1 className="text-lg font-semibold">Administration</h1>{msg && <p className="text-sm" role="status">{msg}</p>}
+    <div className="mx-auto max-w-6xl space-y-4 p-4"><h1 className="text-lg font-semibold">การจัดการระบบ</h1>{msg && <p className="text-sm" role="status">{msg}</p>}{err && <p className="text-sm text-red-600" role="alert">{err}</p>}
+      <section className="space-y-3 rounded bg-white p-4 text-sm">
+        <h2 className="font-medium">รออนุมัติ</h2>
+        {pending.length === 0 ? <p className="text-slate-500">ไม่มีบัญชีรออนุมัติ</p> : <div className="space-y-3">
+          {pending.map(user => <div key={user.id} className="flex flex-wrap items-center gap-2 border-t pt-3">
+            <div className="min-w-48 flex-1"><b>{user.full_name || 'ไม่ระบุชื่อ'}</b><div>{user.phone ?? 'ไม่มีเบอร์โทรศัพท์'}</div><div className="text-slate-500">สมัครเมื่อ {new Date(user.created_at).toLocaleString('th-TH')}</div></div>
+            {user.phone
+              ? <>
+                <label>บทบาทหลังอนุมัติ
+                  <select className="ml-1 rounded border p-1" value={approveRoles[user.id] ?? 'employee'} onChange={e => setApproveRoles({ ...approveRoles, [user.id]: e.target.value as Role })}>
+                    {(Object.keys(ROLE_TH) as Role[]).filter(role => role !== 'admin').map(role => <option key={role} value={role}>{ROLE_TH[role]}</option>)}
+                  </select>
+                </label>
+                <button className="rounded bg-mint px-3 py-1 text-white" onClick={() => approve(user)}>อนุมัติ</button>
+                <button className="rounded border border-red-300 px-3 py-1 text-red-700" onClick={() => upd(user.id, { approval_status: 'rejected' })}>ปฏิเสธ</button>
+              </>
+              : <p className="text-amber-800">บัญชีที่สร้างจาก Dashboard ต้องกำหนด role และอนุมัติผ่าน SQL</p>}
+          </div>)}
+        </div>}
+      </section>
+      <section className="space-y-2 rounded bg-white p-4 text-sm">
+        <h2 className="font-medium">รหัสเข้าร่วมบริษัท</h2>
+        <label className="block">รหัสเข้าร่วม
+          <input className="mt-1 w-full rounded border p-2" value={joinCode} onChange={e => setJoinCode(e.target.value)} />
+        </label>
+        <button onClick={saveJoinCode} className="rounded bg-mint px-3 py-1 text-white">บันทึกรหัสเข้าร่วม</button>
+      </section>
       {pol && <div className="space-y-2 rounded bg-white p-4 text-sm"><h2 className="font-medium">กติกาส่งไอเดียประจำสัปดาห์</h2>
         <label className="flex items-center gap-2"><input type="checkbox" checked={pol.enabled} onChange={e => setPol({ ...pol, enabled: e.target.checked })} />เปิดใช้งาน</label>
         <div className="flex flex-wrap gap-3"><label>กำหนดส่ง (สิ้นวัน)<select className="ml-1 rounded border p-1" value={pol.deadline_dow} onChange={e => setPol({ ...pol, deadline_dow: Number(e.target.value) })}>{DOW.map((d, i) => <option key={d} value={i + 1}>{d}</option>)}</select></label>
           <label>ส่งอย่างน้อย/สัปดาห์<input type="number" min={1} className="ml-1 w-16 rounded border p-1" value={pol.required_count} onChange={e => setPol({ ...pol, required_count: Math.max(1, Number(e.target.value)) })} /></label>
           <label>เริ่มนับสัปดาห์หลังวันที่<input type="date" className="ml-1 rounded border p-1" value={pol.start_date} onChange={e => setPol({ ...pol, start_date: e.target.value })} /></label></div>
         <button onClick={savePol} className="rounded bg-mint px-3 py-1 text-white">บันทึกกติกา</button> <button className="rounded border px-3 py-1" onClick={async () => { const { error } = await supabase.rpc('send_compliance_reminders'); setMsg(error ? error.message : 'ส่งแจ้งเตือนแล้ว') }}>ส่งแจ้งเตือนคนค้างส่งตอนนี้</button></div>}
-      <div className="overflow-x-auto rounded bg-white p-4 text-sm"><h2 className="mb-2 font-medium">ผู้ใช้งาน</h2><table className="w-full text-left"><thead><tr><th>ชื่อ</th><th>บทบาท</th><th>เปิดใช้งาน</th><th>ยกเว้นกติกาส่งงาน</th></tr></thead><tbody>
-        {users.map(u => <tr key={u.id} className="border-t"><td>{nameOf(u)}</td><td><select className="rounded border p-1" value={u.role} onChange={e => upd(u.id, { role: e.target.value as Role })}>{(Object.keys(ROLE_TH) as Role[]).map(r => <option key={r} value={r}>{ROLE_TH[r]}</option>)}</select></td>
-          <td><input type="checkbox" checked={u.is_active} onChange={e => upd(u.id, { is_active: e.target.checked })} /></td><td><input type="checkbox" checked={u.exempt_from_submission} onChange={e => upd(u.id, { exempt_from_submission: e.target.checked })} /></td></tr>)}</tbody></table></div>
+      <div className="overflow-x-auto rounded bg-white p-4 text-sm"><h2 className="mb-2 font-medium">ผู้ใช้งาน</h2><table className="w-full text-left"><thead><tr><th>ชื่อ</th><th>รหัสพนักงาน</th><th>บทบาท</th><th>เปิดใช้งาน</th><th>ยกเว้นกติกาส่งงาน</th></tr></thead><tbody>
+        {users.map(u => <tr key={u.id} className="border-t"><td>{nameOf(u)}</td>
+          <td><input className="w-28 rounded border p-1" aria-label={`รหัสพนักงานของ ${nameOf(u)}`} value={codeDrafts[u.id] ?? ''} onChange={e => setCodeDrafts({ ...codeDrafts, [u.id]: e.target.value })} /><button className="ml-1 rounded border px-2 py-1" onClick={() => upd(u.id, { employee_code: codeDrafts[u.id]?.trim() || null })}>บันทึกรหัส</button></td>
+          <td><select className="rounded border p-1" aria-label={`บทบาทของ ${nameOf(u)}`} value={u.role} onChange={e => upd(u.id, { role: e.target.value as Role })}>{(Object.keys(ROLE_TH) as Role[]).filter(role => role !== 'admin' || u.role === 'admin').map(r => <option key={r} value={r}>{ROLE_TH[r]}</option>)}</select></td>
+          <td><input type="checkbox" aria-label={`เปิดใช้งานบัญชี ${nameOf(u)}`} checked={u.is_active} onChange={e => upd(u.id, { is_active: e.target.checked })} /></td><td><input type="checkbox" aria-label={`ยกเว้นกติกาส่งงาน ${nameOf(u)}`} checked={u.exempt_from_submission} onChange={e => upd(u.id, { exempt_from_submission: e.target.checked })} /></td></tr>)}</tbody></table></div>
+      <aside className="rounded border border-amber-300 bg-amber-50 p-4 text-sm">
+        <h2 className="font-medium">การรีเซ็ต PIN</h2>
+        <p>หากพนักงานลืม PIN ให้ผู้ดูแลรีเซ็ตผ่าน Supabase SQL Editor โดยใช้คำสั่งใน <code>supabase/admin/reset_pin.sql</code> แล้วแจ้ง PIN ใหม่ให้เจ้าของบัญชีผ่านช่องทางที่ปลอดภัย พนักงานควรเปลี่ยน PIN หลังเข้าสู่ระบบ</p>
+      </aside>
       <div className="rounded bg-white p-4 text-sm"><h2 className="mb-2 font-medium">Audit Log ล่าสุด</h2>{aud.length === 0 ? <p className="text-slate-500">ยังไม่มีบันทึก</p> : aud.map(a => <p key={a.id} className="break-all">{new Date(a.created_at).toLocaleString('th-TH')} · {a.action} · {JSON.stringify(a.detail)}</p>)}</div>
     </div>)
 }
@@ -433,16 +743,20 @@ function Workspace({ me }: { me: Profile }) {
   useEffect(() => { load() }, [load])
   const shown = ideas.filter(i => (!fs || i.status === fs) && (i.title + i.code).toLowerCase().includes(q.toLowerCase()))
   const cur = ideas.find(i => i.id === sel)
-  const [tab, setTab] = useState<'dash' | 'ideas' | 'kanban' | 'notif' | 'portfolio' | 'analytics' | 'calendar' | 'admin'>('dash')
+  const [tab, setTab] = useState<'dash' | 'ideas' | 'kanban' | 'notif' | 'portfolio' | 'analytics' | 'calendar' | 'admin' | 'pin'>('dash')
   const unread = notifs.filter(n => !n.is_read).length
   const open = (id: string) => { setSel(id); setAdding(false); setTab('ideas') }
   return (
     <div className="min-h-screen">
-      <header className="flex items-center justify-between bg-navy px-4 py-3 text-white">
-        <b>SSC Creator</b><span className="text-sm">{me.display_name || me.full_name || 'ผู้ใช้'} · {ROLE_TH[me.role]} <button className="ml-3 underline" onClick={() => supabase.auth.signOut()}>ออกจากระบบ</button></span>
+      <header className="flex flex-wrap items-center justify-between gap-y-2 bg-navy px-4 py-3 text-white">
+        <div className="flex items-center gap-2">
+          <img src="/ssc-logo-192.png" alt="SSC Creator" className="h-10 w-10 rounded bg-white object-contain" />
+          <b>SSC Creator</b>
+        </div><span className="flex min-w-0 flex-wrap items-center justify-end text-right text-xs sm:text-sm">{me.display_name || me.full_name || 'ผู้ใช้'} · {ROLE_TH[me.role]} <button className="ml-3 underline" onClick={() => supabase.auth.signOut()}>ออกจากระบบ</button></span>
       </header>
-      <nav className="flex gap-1 bg-white px-4 shadow-sm">{([['dash', 'Dashboard'], ['ideas', 'ไอเดีย'], ['kanban', 'Kanban'], ['portfolio', 'My Portfolio'], ['analytics', 'Analytics'], ['calendar', 'ปฏิทิน'], ['admin', 'Administration'], ['notif', 'แจ้งเตือน' + (unread ? ` (${unread})` : '')]] as const).filter(([k]) => k !== 'admin' || me.role === 'admin').map(([k, l]) => <button key={k} onClick={() => setTab(k)} className={`px-3 py-2 text-sm ${tab === k ? 'border-b-2 border-mint font-medium' : 'text-slate-500'}`}>{l}</button>)}</nav>
+      <nav className="flex gap-1 overflow-x-auto bg-white px-4 shadow-sm">{([['dash', 'Dashboard'], ['ideas', 'ไอเดีย'], ['kanban', 'Kanban'], ['portfolio', 'My Portfolio'], ['analytics', 'Analytics'], ['calendar', 'ปฏิทิน'], ['admin', 'การจัดการระบบ'], ['pin', 'เปลี่ยน PIN'], ['notif', 'แจ้งเตือน' + (unread ? ` (${unread})` : '')]] as const).filter(([k]) => (k !== 'admin' || me.role === 'admin') && (k !== 'pin' || me.role !== 'admin')).map(([k, l]) => <button key={k} onClick={() => setTab(k)} className={`whitespace-nowrap px-3 py-2 text-sm ${tab === k ? 'border-b-2 border-mint font-medium' : 'text-slate-500'}`}>{l}</button>)}</nav>
       {tab === 'dash' && <Dashboard ideas={ideas} me={me} open={open} />}
+      {tab === 'pin' && me.role !== 'admin' && <ChangePin />}
       {tab === 'notif' && <NotifCenter list={notifs} open={open} reload={load} />}
       {tab === 'portfolio' && <Portfolio me={me} ideas={ideas} open={open} />}
       {tab === 'analytics' && <Analytics />}
@@ -468,18 +782,30 @@ function Workspace({ me }: { me: Profile }) {
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null); const [me, setMe] = useState<Profile | null>(null); const [ready, setReady] = useState(false)
+  const [profileError, setProfileError] = useState('')
   useEffect(() => {
     if (!configured) { setReady(true); return }
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setReady(true) })
     const { data } = supabase.auth.onAuthStateChange((_e, s) => setSession(s)); return () => data.subscription.unsubscribe()
   }, [])
   useEffect(() => {
-    if (!session) { setMe(null); return }
-    supabase.from('profiles').select('id,full_name,display_name,role').eq('id', session.user.id).single().then(r => setMe(r.data as Profile | null))
+    if (!session) { setMe(null); setProfileError(''); return }
+    setMe(null)
+    void (async () => {
+      try {
+        const r = await supabase.from('profiles').select('id,full_name,display_name,role,approval_status').eq('id', session.user.id).single()
+        if (r.error) setProfileError('โหลดโปรไฟล์ไม่สำเร็จ: ' + r.error.message)
+        else { setMe(r.data as Profile); setProfileError('') }
+      } catch (error) {
+        setProfileError('โหลดโปรไฟล์ไม่สำเร็จ: ' + (error instanceof Error ? error.message : 'เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ'))
+      }
+    })()
   }, [session])
   if (!configured) return <div className="p-8"><h1 className="text-xl font-semibold">ยังไม่ได้ตั้งค่า Supabase</h1><p>คัดลอก .env.example เป็น .env แล้วใส่ URL และ anon key (ดู README)</p></div>
   if (!ready) return <p className="p-8">กำลังโหลด…</p>
   if (!session) return <Login />
+  if (profileError) return <main className="p-8"><p className="text-red-600" role="alert">{profileError}</p><button className="mt-3 underline" onClick={() => supabase.auth.signOut()}>ออกจากระบบ</button></main>
   if (!me) return <p className="p-8">กำลังโหลดโปรไฟล์… หากค้างอยู่ ให้ตรวจว่ารัน migration แล้ว</p>
+  if (me.approval_status !== 'approved') return <ApprovalNotice status={me.approval_status} />
   return <Workspace me={me} />
 }

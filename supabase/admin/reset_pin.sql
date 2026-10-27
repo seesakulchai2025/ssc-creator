@@ -1,0 +1,5 @@
+-- Replace the phone number and PIN with the account and new 6-8 digit PIN.
+-- The email uses the configured VITE_LOGIN_DOMAIN (default: ssc.internal).
+-- update auth.users
+-- set encrypted_password = extensions.crypt('NEW_PIN', extensions.gen_salt('bf'))
+-- where email = '0812345678@ssc.internal';

@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/lib/supabase.ts","./src/lib/workflow.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/main.tsx","./src/lib/auth.ts","./src/lib/supabase.ts","./src/lib/workflow.ts"],"version":"5.9.3"}
