@@ -1,6 +1,8 @@
--- 1. In Supabase Dashboard > Authentication > Users > Add user, create the admin
---    with a real email and password, and enable "Auto Confirm User".
--- 2. Replace the example email below, then run this query in the SQL Editor.
+-- Create the first admin in Supabase Dashboard > Authentication > Users > Add user
+-- with a real email, password, and Auto Confirm enabled.
+-- After migration 0006, emails outside the configured PIN domain are automatically
+-- assigned role=admin and approval_status=approved. This query is only for an
+-- existing account that needs to be promoted manually.
 -- update public.profiles
 -- set role = 'admin', approval_status = 'approved'
 -- where id = (select id from auth.users where email = 'admin@example.com');

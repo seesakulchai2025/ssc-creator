@@ -1,0 +1,5 @@
+[functions.pin-login]
+verify_jwt = false
+
+[functions.pin-register]
+verify_jwt = false
