@@ -40,7 +40,7 @@ alter table published_contents enable row level security; alter table portfolio_
 create policy contrib_read on portfolio_contributions for select to authenticated using (true);
 create policy pub_read on published_contents for select to authenticated using (
   exists (select 1 from content_ideas c where c.id = idea_id)
-  or exists (select 1 from portfolio_contributions pc where pc.published_id = id and pc.user_id = auth.uid()));
+  or exists (select 1 from portfolio_contributions pc where pc.published_id = published_contents.id and pc.user_id = auth.uid()));
 create policy pub_insert on published_contents for insert to authenticated with check (
   created_by = auth.uid()
   and exists (select 1 from content_ideas c where c.id = idea_id and c.status in ('ready_to_publish','published','completed')
