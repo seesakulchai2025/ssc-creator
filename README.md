@@ -2,19 +2,31 @@
 
 ## ติดตั้ง
 1. สร้างโปรเจกต์ที่ supabase.com แล้วเปิด SQL Editor
-2. ใน Supabase > Authentication > Providers > Email ให้เปิด Sign-ups, ปิด Confirm email และตั้ง Minimum password length เป็น 6
-3. เปิด CAPTCHA ใน Supabase Auth โดยเลือก Cloudflare Turnstile ตั้งค่า Site key และ Secret key ที่ Cloudflare/Supabase แล้วใส่ Site key ใน `VITE_TURNSTILE_SITE_KEY` ใน `.env` (ห้ามใส่ CAPTCHA secret หรือ service_role key ใน frontend)
-4. รันไฟล์ `supabase/migrations/0001_core.sql` ถึง `supabase/migrations/0006_signup_approval.sql` ตามลำดับใน SQL Editor
-5. คัดลอก `.env.example` เป็น `.env` แล้วใส่ Project URL และ anon key (Settings > API) กำหนด `VITE_LOGIN_DOMAIN` ให้ตรงกับ domain สำหรับบัญชีพนักงาน (ค่าเริ่มต้น `ssc.internal`) และตั้งค่า `VITE_TURNSTILE_SITE_KEY`
-6. ใน Supabase Dashboard > Authentication > Users > Add user สร้างบัญชีผู้ดูแลด้วยอีเมลจริง รหัสผ่าน และเปิด Auto Confirm User จากนั้นแก้และรันคำสั่งใน `supabase/admin/make_admin.sql` เพื่อกำหนด role เป็น admin
-7. เปลี่ยนค่าเริ่มต้น `<CHANGE_ME>` ของรหัสเข้าร่วมในหน้าผู้ดูแลระบบก่อนเปิดให้พนักงานสมัคร
-8. รัน `npm install` แล้ว `npm run dev`
+2. ใน Supabase > Authentication > Providers > Email ปิด **Allow new users to sign up** (พนักงานสมัครผ่าน Edge Function ฝั่งเซิร์ฟเวอร์) จากนั้นตั้งรหัสผ่านขั้นต่ำ 6 ตัวอักษรและเปิด CAPTCHA ใน Authentication settings; ผู้ดูแลเลือก **Auto Confirm User** ตอนสร้างบัญชี จึงไม่ต้องพึ่งการยืนยันอีเมล
+3. สร้าง Cloudflare Turnstile widget แล้วเปิด CAPTCHA ใน Supabase Auth ตั้งค่า Turnstile Site key และ Secret key; frontend รับเฉพาะ Site key และ Edge Function ตรวจ token ซ้ำ
+4. รัน `supabase/migrations/0001_core.sql` ถึง `0005_reminders_files_masters.sql` แล้วรัน `supabase/migrations/0006_pin_auth_access.sql` ตามลำดับใน SQL Editor
+5. ใน Supabase Dashboard > Authentication > Users > Add user สร้างบัญชีผู้ดูแลคนแรกด้วยอีเมลจริง รหัสผ่าน และเลือก Auto Confirm User หลัง migration บัญชีอีเมลที่ไม่ลงท้ายด้วย PIN domain จะเป็นผู้ดูแลระบบที่อนุมัติแล้วโดยอัตโนมัติ (ดูตัวอย่าง SQL ใน `supabase/admin/make_admin.sql`)
+6. ติดตั้ง Supabase CLI หากยังไม่มี แล้วตั้งค่าโปรเจกต์:
+   ```powershell
+   npx supabase login
+   npx supabase link --project-ref YOUR_PROJECT_REF
+   ```
+7. ตั้งค่า Edge Function secrets โดยแทนค่าตัวอย่างด้วยข้อมูลจริง (ห้ามใส่ service role key ใน `.env` หรือ VITE variable):
+   ```powershell
+   npx supabase secrets set ALLOWED_ORIGINS=https://your-app.example.com TURNSTILE_SECRET_KEY=replace-with-turnstile-secret
+   npx supabase functions deploy pin-login --no-verify-jwt
+   npx supabase functions deploy pin-register --no-verify-jwt
+   ```
+   `ALLOWED_ORIGINS` รับ origin ที่อนุญาตหลายค่า คั่นด้วย comma เช่น `https://app.example.com,http://localhost:5173`
+8. คัดลอก `.env.example` เป็น `.env` แล้วใส่เฉพาะ Project URL, anon key และ `VITE_TURNSTILE_SITE_KEY` (public) ห้ามใส่ service role key ใน frontend หรือในตัวแปรชื่อ `VITE_`
+9. เปลี่ยนรหัสเข้าร่วมเริ่มต้น `<CHANGE_ME>` ในหน้าการจัดการระบบก่อนเปิดรับคำขอ แล้วรัน `npm install` และ `npm run dev`
 
 ### การสมัครและอนุมัติบัญชี
-- พนักงานสมัครด้วยชื่อ เบอร์โทรศัพท์ PIN 6-8 หลัก และรหัสเข้าร่วม จากนั้นบัญชีจะรอผู้ดูแลอนุมัติ ผู้ดูแลกำหนดบทบาทหรือปฏิเสธได้ในหน้า Administration
-- พนักงานเข้าสู่ระบบด้วยเบอร์โทรศัพท์และ PIN ผู้ดูแลเข้าสู่ระบบด้วยอีเมลจริงและรหัสผ่านที่สร้างใน Supabase
-- เบอร์โทรศัพท์จัดเก็บแยกใน `profile_private` และอ่านได้เฉพาะเจ้าของบัญชีกับผู้ดูแลระบบ ผู้ใช้อื่นไม่เห็นเบอร์โทรศัพท์ตามหลักการคุ้มครองข้อมูลส่วนบุคคล (PDPA)
-- หากลืม PIN ให้ผู้ดูแลใช้คำสั่งตัวอย่างใน `supabase/admin/reset_pin.sql` จาก SQL Editor และส่ง PIN ใหม่ให้เจ้าของบัญชีผ่านช่องทางที่ปลอดภัย
+- พนักงานสมัครด้วยชื่อ เบอร์โทรศัพท์ PIN 6-8 หลัก และรหัสเข้าร่วม ผ่าน `pin-register`; PIN ต้องไม่เป็นเลขซ้ำหรือลำดับตรง บัญชี Auth จะใช้อีเมลสุ่มรูปแบบ `<uuid>@ssc.internal` (แก้ได้ที่ `app_settings.pin_domain`) โดยไม่เปิดเผยให้ผู้ใช้กรอก บัญชีเริ่มต้นเป็นพนักงานและรออนุมัติ
+- พนักงานเข้าสู่ระบบด้วย PIN ผ่าน `pin-login` โดยไม่กรอกเบอร์/ชื่อ/อีเมล ส่วนผู้ดูแลใช้แท็บ “อีเมล” และอีเมลจริงกับรหัสผ่าน
+- ระบบล็อกอิน PIN จำกัดความล้มเหลว 8 ครั้งต่อ IP ใน 10 นาที และ 60 ครั้งรวมทุก IP ใน 10 นาที เมื่อเกินกำหนดจะตอบ 429 และแสดงข้อความให้รอสักครู่
+- ผู้ดูแลอนุมัติ/ปฏิเสธคำขอ เปลี่ยนบทบาท และรีเซ็ต PIN ในหน้าการจัดการระบบ PIN ใหม่ที่สร้างโดยผู้ดูแลจะแสดงให้จดไว้ทันทีเพียงครั้งเดียว ผู้ใช้เปลี่ยน PIN ของตนได้ในหน้าโปรไฟล์
+- เบอร์โทรศัพท์จัดเก็บใน `profile_private` แยกจากโปรไฟล์ ผู้ใช้เห็นเบอร์ของตนเองและผู้ดูแลเห็นเบอร์เพื่อดูแลบัญชีเท่านั้น เบอร์ของพนักงานไม่เปิดให้ผู้ใช้คนอื่นอ่าน ตามหลักการคุ้มครองข้อมูลส่วนบุคคล (PDPA)
 
 ## ใช้งานบนมือถือ
 - ติดตั้งเว็บเป็นแอปได้บน Android และ iOS เมื่อเปิดผ่าน HTTPS
@@ -47,9 +59,8 @@ Notification Center (+แจ้งเตือนเมื่อมีควา�
 - ตาราง departments, content_categories, products, platform_settings (มีข้อมูลตั้งต้นของหมวดและแพลตฟอร์ม)
 
 ## ยังไม่ได้ทำ
-- ฟอร์มและหน้า Admin สำหรับจัดการ departments / products / categories / platforms (ตารางพร้อม ยังไม่ได้ต่อกับ UI)
 - รูปปกผลงาน, วิดีโอไฟล์ใหญ่ (เกิน 10 MB ให้ใช้ลิงก์แทน)
 - ปฏิทินแบบตารางเดือน, ลากวางบนมือถือ
 - เชื่อม API แพลตฟอร์มเพื่อดึงสถิติ, อีเมล/Push
 - การทดสอบอัตโนมัติ (ยังไม่มี test suite)
-- ยังไม่ได้ทดสอบการสมัคร/ล็อกอิน, การตรวจรหัสเข้าร่วม, การอนุมัติ/ปฏิเสธ, RLS ของเบอร์โทรศัพท์, CAPTCHA หรือการรีเซ็ต PIN กับ Supabase project จริง ต้องตั้งค่าและทดสอบรายการเหล่านี้ใน project ของผู้ใช้ก่อนเปิดใช้งาน
+- ยังไม่ได้ทดสอบ migration, Edge Functions, CAPTCHA, rate limit, การสมัคร/ล็อกอิน PIN และอีเมล, magic link, RLS/PDPA, การอนุมัติ/ปฏิเสธ, การเปลี่ยน/รีเซ็ต PIN หรือ CRUD กับ Supabase project จริง ต้อง deploy และทดสอบใน project แยกก่อนใช้งานจริง
